@@ -133,18 +133,12 @@ pub mod traits {
         where
             I: IntoIterator<Item = S>,
             S: AsRef<OsStr>;
-        fn with_input_file<P>(self, arg: P) -> Self
-        where
-            P: AsRef<Path>;
-        fn with_input_files<I, P>(self, args: I) -> Self
-        where
-            I: IntoIterator<Item = P>,
-            P: AsRef<Path>;
-        fn with_output_file<P>(self, filename: P) -> Self
-        where
-            P: AsRef<Path>;
 
-        async fn archive(self) -> Result<(), ToolchainError>;
+        async fn archive<I, P, O>(&self, input: I, output: P) -> Result<(), ToolchainError>
+        where
+            P: AsRef<OsStr> + Send + Sync,
+            I: IntoIterator<Item = O> + Send + Sync,
+            O: AsRef<OsStr> + Send + Sync;
     }
 
     pub trait Toolchain {
@@ -239,12 +233,64 @@ pub mod llvm {
         }
     }
 
+    #[derive(Debug)]
+    pub enum LibtoolFamily {
+        Ar,
+        DarwinLibtool,
+        MsvcLib,
+    }
+
+    impl Default for LibtoolFamily {
+        fn default() -> Self {
+            Self::Ar
+        }
+    }
+
+    #[derive(Debug, Default)]
     pub struct Libtool {
+        family: LibtoolFamily,
         working_directory: PathBuf,
         ar: PathBuf,
         flags: Vec<OsString>,
-        output_path: Option<PathBuf>,
-        inputs: Vec<PathBuf>,
+    }
+
+    impl Libtool {
+        pub fn new<P: AsRef<Path>>(path: P) -> Self {
+            let family = if let Some(file_name) = path
+                .as_ref()
+                .file_name()
+                .and_then(|file_name| file_name.to_str())
+            {
+                if file_name.contains("libtool") {
+                    LibtoolFamily::DarwinLibtool
+                } else if file_name.contains("lib") {
+                    LibtoolFamily::MsvcLib
+                } else if file_name.contains("ar") {
+                    LibtoolFamily::Ar
+                } else {
+                    panic!("lib tool was none of \"libtool\", \"lib.exe\" or \"ar\".");
+                }
+            } else {
+                LibtoolFamily::Ar
+            };
+
+            Self {
+                family,
+                ar: path.as_ref().to_owned(),
+                ..Default::default()
+            }
+        }
+
+        pub fn with_default_flags(self, flags: Vec<OsString>) -> Self {
+            Self { flags, ..self }
+        }
+
+        pub fn with_cwd<P: AsRef<Path>>(self, path: P) -> Self {
+            Self {
+                working_directory: path.as_ref().to_owned(),
+                ..self
+            }
+        }
     }
 
     impl Libtool {
@@ -293,13 +339,9 @@ pub mod llvm {
         }
 
         fn libtool(&self) -> Self::Archiver {
-            Libtool {
-                working_directory: self.working_directory.clone(),
-                ar: self.archiver.clone(),
-                flags: self.default_ar_flags.clone(),
-                output_path: None,
-                inputs: Vec::default(),
-            }
+            Libtool::new(&self.archiver)
+                .with_cwd(&self.working_directory)
+                .with_default_flags(self.default_ar_flags.clone())
         }
     }
 
@@ -665,28 +707,40 @@ pub mod llvm {
             self
         }
 
-        fn with_output_file<P>(mut self, filename: P) -> Self
+        async fn archive<I, P, O>(&self, inputs: I, output: P) -> Result<(), ToolchainError>
         where
-            P: AsRef<Path>,
+            P: AsRef<OsStr> + Send + Sync,
+            I: IntoIterator<Item = O> + Send + Sync,
+            O: AsRef<OsStr> + Send + Sync,
         {
-            self.output_path = Some(filename.as_ref().to_owned());
-            self
-        }
-
-        async fn archive(self) -> Result<(), ToolchainError> {
             log::debug!("libtool: {:?}", self.flags);
 
-            let output = self
-                .output_path
-                .ok_or(ToolchainError::ArchiveError("no output path".to_owned()))?;
+            let mut libtool = Command::new(&self.ar);
+            libtool.current_dir(&self.working_directory);
 
-            Command::new(&self.ar)
-                .current_dir(&self.working_directory)
-                .args(self.flags)
-                .arg(&output)
-                .args(self.inputs)
+            match self.family {
+                LibtoolFamily::Ar => {
+                    libtool.arg("rcsT").arg(&output).args(inputs);
+                }
+                LibtoolFamily::MsvcLib => {
+                    let mut out_name = OsString::from("/NAME");
+                    out_name.push(&output);
+
+                    libtool.arg("/NOLOGO").arg(&out_name).args(inputs);
+                }
+                LibtoolFamily::DarwinLibtool => {
+                    libtool.arg("-static").arg("-o").arg(output).args(inputs);
+                }
+            }
+
+            libtool
                 .output()
-                .map_err(|_| ToolchainError::ArchiveError("failed to invoke libtool".to_owned()))
+                .map_err(|_| {
+                    ToolchainError::ArchiveError(format!(
+                        "failed to invoke archiver {:?}",
+                        &self.ar
+                    ))
+                })
                 .and_then(|output| async move {
                     match output.status.success() {
                         true => Ok(()),
@@ -696,25 +750,6 @@ pub mod llvm {
                     }
                 })
                 .await
-        }
-
-        fn with_input_file<P>(mut self, arg: P) -> Self
-        where
-            P: AsRef<Path>,
-        {
-            self.inputs.push(arg.as_ref().to_owned());
-            self
-        }
-
-        fn with_input_files<I, P>(mut self, args: I) -> Self
-        where
-            I: IntoIterator<Item = P>,
-            P: AsRef<Path>,
-        {
-            for arg in args {
-                self.inputs.push(arg.as_ref().to_owned());
-            }
-            self
         }
     }
 }
@@ -890,7 +925,7 @@ mod tests {
     use crate::{
         compiledb::CompileDBEntry,
         llvm::LLVM,
-        traits::{Compiler, Linker, Toolchain},
+        traits::{Archiver, Compiler, Linker, Toolchain},
     };
 
     const MAIN_CC: &str = r#"
@@ -925,6 +960,24 @@ return 0;
 
         let cc = llvm.compiler().with_cpp_version("c++17");
         let _compiledb = cc.compile(main_cc, main_o).await.expect("compile");
+    }
+
+    #[tokio::test]
+    async fn compile_and_archive() {
+        let temp_dir = temp_dir().unwrap();
+        let main_cc = temp_main_cc(temp_dir.path()).unwrap();
+        let main_o = main_cc.with_extension("o");
+        let main_lib = main_cc.with_extension("lib");
+
+        let llvm = LLVM::default().with_working_directory(temp_dir.path());
+
+        let cc = llvm.compiler().with_cpp_version("c++17").with_arg("-flto");
+        let _compiledb = cc.compile(&main_cc, &main_o).await.expect("compile");
+
+        llvm.libtool()
+            .archive(&[&main_o], &main_lib)
+            .await
+            .expect("archive");
     }
 
     #[tokio::test]
