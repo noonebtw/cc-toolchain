@@ -187,7 +187,6 @@ pub mod llvm {
         working_directory: PathBuf,
     }
 
-    #[cfg(not(target_os = "macos"))]
     impl Default for LLVM {
         fn default() -> Self {
             let clang = which::which("clang").expect("clang");
@@ -199,7 +198,10 @@ pub mod llvm {
                 default_cc_flags: Default::default(),
                 linker: clang,
                 default_ld_flags: ld_flags,
+                #[cfg(not(target_os = "macos"))]
                 archiver: which::which("llvm-ar").expect("llvm-ar"),
+                #[cfg(target_os = "macos")]
+                archiver: which::which("llvm-libtool-darwin").expect("llvm-libtool-darwin"),
                 default_ar_flags: Default::default(),
                 working_directory: Default::default(),
             }
