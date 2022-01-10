@@ -19,18 +19,18 @@ pub mod error {
 
     #[derive(Debug, thiserror::Error)]
     pub enum ToolchainError {
-        #[error("The source file ({0:?}) does not have a valid include dependency graph")]
+        #[error("The source file ({0:?}) does not have a valid include dependency graph\n{1:?}")]
         /// contains optional diagnostics
         InvalidDependencyGraph(PathBuf, Option<String>),
         #[error("Failed to compile the source file ({0:?})")]
         CompilationError(PathBuf),
-        #[error("Failed to link program")]
+        #[error("Failed to link program:\n{0}")]
         /// contains diagnostics
         LinkError(String),
-        #[error("Failed to create static library")]
+        #[error("Failed to create static library:\n{0}")]
         /// contains diagnostics
         ArchiveError(String),
-        #[error("Failed to compile the source file ({file:?})")]
+        #[error("Failed to compile the source file ({file:?}):\n{diagnostics}")]
         CompilationWithDiagnosticsError { file: PathBuf, diagnostics: String },
     }
 
@@ -995,6 +995,7 @@ return 0;
         let _compiledb = cc.compile(&main_cc, &main_o).await.expect("compile");
 
         llvm.linker()
+            .with_stdlib()
             .with_arg("-flto")
             .link(&[&main_o], &main_out)
             .await
