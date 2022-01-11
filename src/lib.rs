@@ -74,9 +74,14 @@ pub mod traits {
         where
             CppStandard: Into<String>;
 
-        async fn compile<P>(&self, input: P, output: P) -> Result<CompileDBEntry, ToolchainError>
+        async fn compile<I, O>(
+            &self,
+            input: I,
+            output: O,
+        ) -> Result<CompileDBEntry, ToolchainError>
         where
-            P: AsRef<Path> + Send + Sync;
+            I: AsRef<Path> + Send + Sync,
+            O: AsRef<Path> + Send + Sync;
 
         async fn dependencies<P>(&self, input: P) -> Result<DependencyMapEntry, ToolchainError>
         where
@@ -436,9 +441,10 @@ pub mod llvm {
             self
         }
 
-        async fn compile<P>(&self, input: P, output: P) -> Result<CompileDBEntry, ToolchainError>
+        async fn compile<I, O>(&self, input: I, output: O) -> Result<CompileDBEntry, ToolchainError>
         where
-            P: AsRef<Path> + Send + Sync,
+            I: AsRef<Path> + Send + Sync,
+            O: AsRef<Path> + Send + Sync,
         {
             log::debug!(
                 "cc: {:?} -> {:?} {:?}",
@@ -487,7 +493,7 @@ pub mod llvm {
                             output.as_ref().to_string_lossy().to_string(),
                             input_string,
                         )),
-                        output: None,
+                        output: Some(output.as_ref().to_string_lossy().to_string()),
                     }
                 })
         }
@@ -784,6 +790,7 @@ pub mod dependency_map {
         borrow::Borrow,
         collections::{BTreeMap, HashSet},
         hash::Hash,
+        io::{Read, Write},
         path::{Path, PathBuf},
         time::SystemTime,
     };
@@ -791,6 +798,43 @@ pub mod dependency_map {
     use serde::{Deserialize, Serialize};
 
     pub type DependencyMap = HashSet<DependencyMapEntry>;
+
+    pub trait DependencyMapExt: Sized {
+        fn from_path<P>(path: P) -> anyhow::Result<Self>
+        where
+            P: AsRef<Path>;
+        fn to_path<P>(self, path: P) -> anyhow::Result<()>
+        where
+            P: AsRef<Path>;
+
+        fn contains_eq_entry(&self, entry: &DependencyMapEntry) -> bool;
+    }
+
+    impl DependencyMapExt for DependencyMap {
+        fn from_path<P>(path: P) -> anyhow::Result<Self>
+        where
+            P: AsRef<Path>,
+        {
+            let mut file = std::fs::File::open(&path)?;
+
+            let mut contents = Vec::new();
+            file.read_to_end(&mut contents)?;
+            Ok(bincode::deserialize::<Self>(&contents)?)
+        }
+
+        fn to_path<P>(self, path: P) -> anyhow::Result<()>
+        where
+            P: AsRef<Path>,
+        {
+            let mut file = std::fs::File::create(&path)?;
+            file.write_all(&bincode::serialize(&self)?)?;
+            Ok(())
+        }
+
+        fn contains_eq_entry(&self, entry: &DependencyMapEntry) -> bool {
+            self.get(entry).map(|ele| ele == entry).unwrap_or(false)
+        }
+    }
 
     #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
     pub struct DependencyMapEntry {
@@ -903,6 +947,12 @@ pub mod compiledb {
     #[derive(Default, Debug, Deserialize, Serialize)]
     pub struct CompileDB(pub HashSet<CompileDBEntry>);
 
+    impl FromIterator<CompileDBEntry> for CompileDB {
+        fn from_iter<T: IntoIterator<Item = CompileDBEntry>>(iter: T) -> Self {
+            Self(iter.into_iter().collect::<HashSet<_>>())
+        }
+    }
+
     impl CompileDB {
         pub fn from(hashset: HashSet<CompileDBEntry>) -> Self {
             Self(hashset)
@@ -1014,6 +1064,9 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::{
+        build::BuildBuilder,
+        compiledb::CompileDB,
+        dependency_map::DependencyMap,
         llvm::LLVM,
         traits::{Archiver, Compiler, Linker, Toolchain},
     };
@@ -1038,6 +1091,39 @@ return 0;
         main_cc.write_all(MAIN_CC.as_bytes())?;
 
         Ok(path)
+    }
+
+    #[tokio::test]
+    async fn build() {
+        let temp_dir = temp_dir().unwrap();
+        let main_cc = temp_main_cc(temp_dir.path()).unwrap();
+
+        let dependency_map = DependencyMap::default();
+        let compiledb = CompileDB::default();
+
+        let llvm = LLVM::default().with_working_directory(temp_dir.path());
+        let mut build = BuildBuilder::new(llvm)
+            .with_sources(vec![main_cc])
+            .with_compiledb(compiledb)
+            .with_dependency_map(dependency_map)
+            .with_cc_flags(vec!["-std=c++17".to_string()])
+            .with_build_directory(temp_dir.path())
+            .finish()
+            .expect("builder");
+
+        build.build().await.expect("build");
+
+        for entry in walkdir::WalkDir::new(temp_dir.path())
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            println!("{:?}", entry);
+        }
+
+        assert!(Command::new(temp_dir.path().join("a.out"))
+            .status()
+            .unwrap()
+            .success());
     }
 
     #[tokio::test]
