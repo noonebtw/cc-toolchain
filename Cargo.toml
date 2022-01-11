@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 walkdir = "2.3.0"
 thiserror = "1.0.0"
+anyhow = "1.0.0"
 log = "0.4.0"
 which = "4.2.0"
 futures = "0.3.0"

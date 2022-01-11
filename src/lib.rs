@@ -1,3 +1,5 @@
+pub mod build;
+
 pub mod error {
     use std::path::PathBuf;
 
@@ -33,15 +35,11 @@ pub mod error {
         #[error("Failed to compile the source file ({file:?}):\n{diagnostics}")]
         CompilationWithDiagnosticsError { file: PathBuf, diagnostics: String },
     }
-
-    pub type Result<T> = std::result::Result<T, Error>;
 }
-
-pub use error::Result;
 
 pub mod traits {
     use crate::{
-        compiledb::CompileDBEntry, error::ToolchainError, include_dependencies::IncludeDependencies,
+        compiledb::CompileDBEntry, dependency_map::DependencyMapEntry, error::ToolchainError,
     };
     use std::{ffi::OsStr, path::Path};
 
@@ -80,7 +78,7 @@ pub mod traits {
         where
             P: AsRef<Path> + Send + Sync;
 
-        async fn dependencies<P>(&self, input: P) -> Result<IncludeDependencies, ToolchainError>
+        async fn dependencies<P>(&self, input: P) -> Result<DependencyMapEntry, ToolchainError>
         where
             P: AsRef<Path> + Send + Sync;
     }
@@ -152,6 +150,36 @@ pub mod traits {
     }
 }
 
+pub mod general {
+    #![allow(dead_code)]
+
+    #[derive(Debug)]
+    pub enum CompilerFamily {
+        Clang,
+        GCC,
+        MSVC,
+        MSVCClang,
+    }
+
+    #[derive(Debug)]
+    pub enum LinkerFamily {
+        Lld,
+        Ld,
+        MSLink,
+    }
+
+    #[derive(Debug)]
+    pub enum LibtoolFamily {
+        Ar,
+        DarwinLibtool,
+        MsvcLib,
+    }
+
+    pub struct Compiler {}
+    pub struct Linker {}
+    pub struct Libtool {}
+}
+
 pub mod llvm {
     #![allow(dead_code)]
 
@@ -162,10 +190,8 @@ pub mod llvm {
     use relative_path::RelativePathBuf;
     use serde::{Deserialize, Serialize};
 
-    use crate::{
-        compiledb::CompileDBEntry, error::ToolchainError,
-        include_dependencies::IncludeDependencies, traits::*,
-    };
+    use crate::dependency_map::DependencyMapEntry;
+    use crate::{compiledb::CompileDBEntry, error::ToolchainError, traits::*};
     use std::{
         collections::BTreeMap,
         ffi::{OsStr, OsString},
@@ -466,7 +492,7 @@ pub mod llvm {
                 })
         }
 
-        async fn dependencies<P>(&self, input: P) -> Result<IncludeDependencies, ToolchainError>
+        async fn dependencies<P>(&self, input: P) -> Result<DependencyMapEntry, ToolchainError>
         where
             P: AsRef<Path> + Send + Sync,
         {
@@ -556,10 +582,7 @@ pub mod llvm {
                             )
                         })
                 })
-                .map(|dependencies| IncludeDependencies {
-                    path: input.as_ref().to_owned(),
-                    dependencies,
-                })
+                .map(|dependencies| DependencyMapEntry::new(input.as_ref(), dependencies))
         }
 
         fn with_cpp_version<CppStandard>(mut self, cpp: CppStandard) -> Self
@@ -756,8 +779,74 @@ pub mod llvm {
     }
 }
 
+pub mod dependency_map {
+    use std::{
+        borrow::Borrow,
+        collections::{BTreeMap, HashSet},
+        hash::Hash,
+        path::{Path, PathBuf},
+        time::SystemTime,
+    };
+
+    use serde::{Deserialize, Serialize};
+
+    pub type DependencyMap = HashSet<DependencyMapEntry>;
+
+    #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+    pub struct DependencyMapEntry {
+        file: PathBuf,
+        dependencies: BTreeMap<PathBuf, SystemTime>,
+    }
+
+    impl Borrow<Path> for DependencyMapEntry {
+        fn borrow(&self) -> &Path {
+            self.file.as_path()
+        }
+    }
+
+    impl Hash for DependencyMapEntry {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.file.hash(state);
+        }
+    }
+
+    impl DependencyMapEntry {
+        pub fn new<P>(file: P, dependencies: BTreeMap<PathBuf, SystemTime>) -> Self
+        where
+            P: Into<PathBuf>,
+        {
+            Self {
+                file: file.into(),
+                dependencies,
+            }
+        }
+
+        pub fn new_from_files<P, I, PI>(for_file: P, with_dependencies: I) -> anyhow::Result<Self>
+        where
+            I: IntoIterator<Item = PI>,
+            P: AsRef<Path>,
+            PI: AsRef<Path>,
+        {
+            let dependencies = with_dependencies
+                .into_iter()
+                .map(|p| {
+                    p.as_ref()
+                        .metadata()
+                        .and_then(|meta| meta.modified())
+                        .map(|time| (p.as_ref().to_owned(), time))
+                })
+                .collect::<std::io::Result<BTreeMap<PathBuf, SystemTime>>>()?;
+
+            Ok(Self {
+                file: for_file.as_ref().to_path_buf(),
+                dependencies,
+            })
+        }
+    }
+}
+
 pub mod include_dependencies {
-    use crate::error::Result;
+    use anyhow::Result;
     use std::{
         collections::BTreeMap,
         path::{Path, PathBuf},
@@ -809,7 +898,7 @@ pub mod compiledb {
 
     use serde::{Deserialize, Serialize};
 
-    use crate::error::Result;
+    use anyhow::Result;
 
     #[derive(Default, Debug, Deserialize, Serialize)]
     pub struct CompileDB(pub HashSet<CompileDBEntry>);
@@ -925,7 +1014,6 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::{
-        compiledb::CompileDBEntry,
         llvm::LLVM,
         traits::{Archiver, Compiler, Linker, Toolchain},
     };
@@ -939,11 +1027,11 @@ return 0;
 }
 "#;
 
-    fn temp_dir() -> crate::error::Result<TempDir> {
+    fn temp_dir() -> anyhow::Result<TempDir> {
         Ok(tempfile::tempdir()?)
     }
 
-    fn temp_main_cc(temp_path: &Path) -> crate::error::Result<PathBuf> {
+    fn temp_main_cc(temp_path: &Path) -> anyhow::Result<PathBuf> {
         let path = temp_path.join("main.cc");
 
         let mut main_cc = std::fs::File::create(&path)?;
