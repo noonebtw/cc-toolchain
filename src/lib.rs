@@ -4,22 +4,6 @@ pub mod error {
     use std::path::PathBuf;
 
     #[derive(Debug, thiserror::Error)]
-    pub enum Error {
-        #[error(transparent)]
-        IO(#[from] std::io::Error),
-        #[error(transparent)]
-        Format(#[from] std::fmt::Error),
-        #[error(transparent)]
-        FromUTF8(#[from] std::string::FromUtf8Error),
-        #[error(transparent)]
-        JsonError(#[from] serde_json::Error),
-        #[error(transparent)]
-        WhichError(#[from] which::Error),
-        #[error(transparent)]
-        ToolchainError(#[from] ToolchainError),
-    }
-
-    #[derive(Debug, thiserror::Error)]
     pub enum ToolchainError {
         #[error("The source file ({0:?}) does not have a valid include dependency graph\n{1:?}")]
         /// contains optional diagnostics
@@ -34,6 +18,8 @@ pub mod error {
         ArchiveError(String),
         #[error("Failed to compile the source file ({file:?}):\n{diagnostics}")]
         CompilationWithDiagnosticsError { file: PathBuf, diagnostics: String },
+        #[error("Invalid target triple: {0:?}")]
+        InvalidTarget(Option<String>),
     }
 }
 
@@ -82,6 +68,8 @@ pub mod traits {
         where
             I: AsRef<Path> + Send + Sync,
             O: AsRef<Path> + Send + Sync;
+
+        async fn target_triple(&self) -> Result<target_lexicon::Triple, ToolchainError>;
 
         async fn dependencies<P>(&self, input: P) -> Result<DependencyMapEntry, ToolchainError>
         where
@@ -189,19 +177,74 @@ pub mod llvm {
     #![allow(dead_code)]
 
     use async_process::Command;
+    use futures::FutureExt;
     use futures::TryFutureExt;
     use rayon::iter::IntoParallelIterator;
     use rayon::iter::ParallelIterator;
     use relative_path::RelativePathBuf;
     use serde::{Deserialize, Serialize};
+    use target_lexicon::Triple;
 
     use crate::dependency_map::DependencyMapEntry;
     use crate::{compiledb::CompileDBEntry, error::ToolchainError, traits::*};
+    use std::str::FromStr;
     use std::{
         collections::BTreeMap,
         ffi::{OsStr, OsString},
         path::{Path, PathBuf},
     };
+
+    #[derive(Debug, Default)]
+    pub struct OutputNameAffixes {
+        pub binary_suffix: Option<String>,
+        pub shared_prefix: Option<String>,
+        pub shared_suffix: Option<String>,
+        pub static_prefix: Option<String>,
+        pub static_suffix: Option<String>,
+    }
+
+    impl From<target_lexicon::BinaryFormat> for OutputNameAffixes {
+        fn from(format: target_lexicon::BinaryFormat) -> Self {
+            match format {
+                target_lexicon::BinaryFormat::Elf => Self::unix(),
+                target_lexicon::BinaryFormat::Coff => Self::windows(),
+                target_lexicon::BinaryFormat::Macho => Self::darwin(),
+                _ => Self::default(),
+            }
+        }
+    }
+
+    impl OutputNameAffixes {
+        pub fn windows() -> Self {
+            Self {
+                binary_suffix: Some(".exe".to_string()),
+                shared_prefix: None,
+                shared_suffix: Some(".dll".to_string()),
+                static_prefix: None,
+                static_suffix: Some(".lib".to_string()),
+            }
+        }
+
+        pub fn unix() -> Self {
+            Self {
+                binary_suffix: None,
+                shared_prefix: Some("lib".to_string()),
+                shared_suffix: Some(".so".to_string()),
+                static_prefix: Some("lib".to_string()),
+                static_suffix: Some(".a".to_string()),
+            }
+        }
+
+        pub fn darwin() -> Self {
+            Self {
+                binary_suffix: None,
+                shared_prefix: Some("lib".to_string()),
+                shared_suffix: Some(".dylib".to_string()),
+                static_prefix: Some("lib".to_string()),
+                static_suffix: Some(".a".to_string()),
+            }
+        }
+    }
 
     #[derive(Debug, Deserialize, Serialize)]
     pub struct LLVM {
@@ -264,6 +307,39 @@ pub mod llvm {
         {
             self.flags.push(arg.as_ref().to_os_string());
         }
+
+        pub async fn target_triple(&self) -> Result<target_lexicon::Triple, ToolchainError> {
+            let mut cc = Command::new(&self.cc);
+            let output = cc
+                .args(&self.flags)
+                .current_dir(&self.working_directory)
+                .arg("--version")
+                .output()
+                .map_err(|e| {
+                    log::error!("invoking compiler failed: {}", e);
+                    ToolchainError::InvalidTarget(Some(e.to_string()))
+                })
+                .map_ok(|output| {
+                    if output.status.success() {
+                        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+                    } else {
+                        Err(ToolchainError::InvalidTarget(Some(
+                            String::from_utf8_lossy(&output.stderr).to_string(),
+                        )))
+                    }
+                })
+                .await?
+                .map(|output| {
+                    output
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Target: "))
+                        .map(|triple| Triple::from_str(triple))
+                })?;
+
+            Ok(output
+                .ok_or(ToolchainError::InvalidTarget(None))?
+                .map_err(|_| ToolchainError::InvalidTarget(None))?)
+        }
     }
 
     #[derive(Debug)]
@@ -324,9 +400,7 @@ pub mod llvm {
                 ..self
             }
         }
-    }
 
-    impl Libtool {
         fn add_arg<S>(&mut self, arg: S)
         where
             S: AsRef<OsStr>,
@@ -597,6 +671,10 @@ pub mod llvm {
         {
             self.add_arg(format!("-std={}", cpp.into()));
             self
+        }
+
+        async fn target_triple(&self) -> Result<target_lexicon::Triple, ToolchainError> {
+            Self::target_triple(self).await
         }
     }
 
@@ -1048,7 +1126,7 @@ pub mod compiledb {
             });
 
             let string = serde_json::to_string(&db).expect("serialize compiledb");
-            println!("{}", &string);
+            log::debug!("{}", &string);
         }
     }
 }
@@ -1061,6 +1139,7 @@ mod tests {
         process::Command,
     };
 
+    use target_lexicon::{Architecture, OperatingSystem, Triple};
     use tempfile::TempDir;
 
     use crate::{
@@ -1111,16 +1190,16 @@ return 0;
             .finish()
             .expect("builder");
 
-        build.build().await.expect("build");
+        build.build("test").await.expect("build");
 
         for entry in walkdir::WalkDir::new(temp_dir.path())
             .into_iter()
             .filter_map(|e| e.ok())
         {
-            println!("{:?}", entry);
+            log::debug!("{:?}", entry);
         }
 
-        assert!(Command::new(temp_dir.path().join("a.out"))
+        assert!(Command::new(temp_dir.path().join("test.exe"))
             .status()
             .unwrap()
             .success());
@@ -1154,6 +1233,29 @@ return 0;
             .archive(&[&main_o], &main_lib)
             .await
             .expect("archive");
+    }
+
+    #[tokio::test]
+    async fn target_triple() {
+        env_logger::init();
+
+        let llvm = LLVM::default().with_working_directory(std::env::current_dir().expect("cwd"));
+        let cc_linux = llvm
+            .compiler()
+            .with_arg("--target=x86_64-linux-gnu")
+            .with_cpp_version("c++17")
+            .with_arg("-flto");
+
+        let triple = cc_linux.target_triple().await.expect("triple");
+
+        assert_eq!(triple.architecture, Architecture::X86_64);
+        assert_eq!(triple.operating_system, OperatingSystem::Linux);
+
+        let cc_host = llvm.compiler().with_cpp_version("c++17").with_arg("-flto");
+
+        let triple = cc_host.target_triple().await.expect("triple");
+
+        assert_eq!(triple, Triple::host());
     }
 
     #[tokio::test]

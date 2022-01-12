@@ -2,13 +2,19 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use crate::llvm::OutputNameAffixes;
 use crate::traits::{Compiler, Linker};
 use crate::{compiledb::CompileDB, traits::Toolchain};
 
 use crate::dependency_map::{DependencyMap, DependencyMapExt};
 
-// FIXME: add cpp standard option, output file name/path, output kind (static,
-// shared, executable)
+#[derive(Debug, Clone, Copy)]
+pub enum Type {
+    Executable,
+    SharedLibrary,
+    StaticLibrary,
+}
+
 pub struct Build<T>
 where
     T: Toolchain + Send + Sync,
@@ -27,8 +33,10 @@ where
     output_directory: PathBuf,
     defines: Vec<String>,
     libraries: Vec<PathBuf>,
+    cpp_standard: Option<String>,
     cc_flags: Vec<String>,
     ld_flags: Vec<String>,
+    output_type: Type,
     /// clang-tools compile data base (compile_commands.json)
     compiledb: CompileDB,
     dependency_map: DependencyMap,
@@ -46,8 +54,10 @@ where
     output_directory: Option<PathBuf>,
     defines: Vec<String>,
     libraries: Vec<PathBuf>,
+    cpp_standard: Option<String>,
     cc_flags: Vec<String>,
     ld_flags: Vec<String>,
+    output_type: Type,
     compiledb_path: Option<PathBuf>,
     dependency_map_path: Option<PathBuf>,
     compiledb: Option<CompileDB>,
@@ -73,6 +83,8 @@ where
             dependency_map_path: None,
             compiledb: None,
             dependency_map: None,
+            cpp_standard: None,
+            output_type: Type::Executable,
         }
     }
 }
@@ -86,6 +98,19 @@ where
             toolchain: Some(toolchain),
             ..Default::default()
         }
+    }
+
+    pub fn with_cpp_standard<S>(mut self, standard: S) -> Self
+    where
+        S: Into<String>,
+    {
+        self.cpp_standard = Some(standard.into());
+        self
+    }
+
+    pub fn with_type(mut self, output_type: Type) -> Self {
+        self.output_type = output_type;
+        self
     }
 
     pub fn with_cc_flags(mut self, cc_flags: Vec<String>) -> Self {
@@ -196,8 +221,10 @@ where
             build_directory,
             defines: self.defines,
             libraries: self.libraries,
+            cpp_standard: self.cpp_standard,
             cc_flags: self.cc_flags,
             ld_flags: self.ld_flags,
+            output_type: self.output_type,
             compiledb,
             dependency_map,
             output_directory,
@@ -223,13 +250,41 @@ where
         return false;
     }
 
-    pub async fn build(&mut self) -> anyhow::Result<()> {
+    pub fn map_output_name<S>(name: S, output_kind: Type, affixes: OutputNameAffixes) -> String
+    where
+        S: Into<String>,
+    {
+        let prefix = match output_kind {
+            Type::Executable => None,
+            Type::SharedLibrary => affixes.shared_prefix,
+            Type::StaticLibrary => affixes.static_prefix,
+        };
+        let suffix = match output_kind {
+            Type::Executable => affixes.binary_suffix,
+            Type::SharedLibrary => affixes.shared_suffix,
+            Type::StaticLibrary => affixes.static_suffix,
+        };
+
+        format!(
+            "{}{}{}",
+            prefix.unwrap_or_default(),
+            name.into(),
+            suffix.unwrap_or_default()
+        )
+    }
+
+    pub async fn build<S>(&mut self, output: S) -> anyhow::Result<()>
+    where
+        S: Into<String>,
+    {
         let cc = self
             .toolchain
             .compiler()
             .with_include_dirs(&self.include_directories)
             .with_defines(&self.defines)
             .with_args(&self.cc_flags);
+
+        let triple = cc.target_triple();
 
         use futures::stream::StreamExt;
 
@@ -238,10 +293,10 @@ where
 
         let objects = futures::stream::iter(self.source_files.iter().cloned())
             .then(|source| async {
-                // FIXME: the source path should first be normalized
-                // before hashing so that its the same no matter the
-                // platform
-                let digest = md5::compute(source.to_str().expect("path to str"));
+                let rel = relative_path::RelativePath::from_path(&source)
+                    .map(|rel| rel.as_str())
+                    .unwrap_or(&source.to_str().expect("path"));
+                let digest = md5::compute(rel);
                 let output = self.output_directory.join(format!("{:x}.o", digest));
 
                 let dependencies = cc.dependencies(&source);
@@ -277,10 +332,16 @@ where
             .with_args(&self.ld_flags)
             .with_libs_from_path(&self.libraries);
 
+        let affixes = triple
+            .await
+            .map(|a| OutputNameAffixes::from(a.binary_format))?;
+
+        let output_path =
+            self.output_directory
+                .join(Self::map_output_name(output, self.output_type, affixes));
+
         // FIXME: add an actual output path here
-        Ok(ld
-            .link(objects, self.output_directory.join("a.out"))
-            .await?)
+        Ok(ld.link(objects, output_path).await?)
     }
 }
 
