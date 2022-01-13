@@ -30,7 +30,7 @@ pub mod traits {
     use std::{ffi::OsStr, path::Path};
 
     #[async_trait::async_trait]
-    pub trait Compiler {
+    pub trait Compiler: Send + Sync {
         fn with_arg<S>(self, arg: S) -> Self
         where
             S: AsRef<OsStr>;
@@ -77,7 +77,7 @@ pub mod traits {
     }
 
     #[async_trait::async_trait]
-    pub trait Linker {
+    pub trait Linker: Send + Sync {
         fn with_arg<S>(self, arg: S) -> Self
         where
             S: AsRef<OsStr>;
@@ -116,7 +116,7 @@ pub mod traits {
     }
 
     #[async_trait::async_trait]
-    pub trait Archiver {
+    pub trait Archiver: Send + Sync {
         fn with_arg<S>(self, arg: S) -> Self
         where
             S: AsRef<OsStr>;
@@ -246,7 +246,7 @@ pub mod llvm {
         }
     }
 
-    #[derive(Debug, Deserialize, Serialize)]
+    #[derive(Debug, Deserialize, Serialize, Clone)]
     pub struct LLVM {
         compiler: PathBuf,
         #[serde(default)]
@@ -914,7 +914,7 @@ pub mod dependency_map {
         }
     }
 
-    #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Clone)]
     pub struct DependencyMapEntry {
         file: PathBuf,
         dependencies: BTreeMap<PathBuf, SystemTime>,
@@ -977,7 +977,7 @@ pub mod include_dependencies {
 
     use serde::{Deserialize, Serialize};
 
-    #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+    #[derive(Debug, PartialEq, Eq, Deserialize, Serialize, Clone)]
     pub struct IncludeDependencies {
         pub path: PathBuf,
         pub dependencies: BTreeMap<PathBuf, SystemTime>,
@@ -1022,7 +1022,7 @@ pub mod compiledb {
 
     use anyhow::Result;
 
-    #[derive(Default, Debug, Deserialize, Serialize)]
+    #[derive(Default, Debug, Deserialize, Serialize, Clone)]
     pub struct CompileDB(pub HashSet<CompileDBEntry>);
 
     impl FromIterator<CompileDBEntry> for CompileDB {
@@ -1062,7 +1062,7 @@ pub mod compiledb {
     }
 
     /// An entry into the [Compilation Database](CompileDB)
-    #[derive(Debug, Deserialize, Serialize)]
+    #[derive(Debug, Deserialize, Serialize, Clone)]
     pub struct CompileDBEntry {
         /// The main translation unit source processed by this compilation step.
         /// This is used by tools as the key into the compilation database. There
@@ -1137,6 +1137,7 @@ mod tests {
         io::Write,
         path::{Path, PathBuf},
         process::Command,
+        sync::Once,
     };
 
     use target_lexicon::{Architecture, OperatingSystem, Triple};
@@ -1146,9 +1147,30 @@ mod tests {
         build::BuildBuilder,
         compiledb::CompileDB,
         dependency_map::DependencyMap,
-        llvm::LLVM,
+        llvm::{OutputNameAffixes, LLVM},
         traits::{Archiver, Compiler, Linker, Toolchain},
     };
+
+    const LIB_CC: &str = r#"
+#include <iostream>
+#include <string_view>
+
+void greet(std::string_view name) {
+std::cout << "Hello, " << name << "!\n";
+}
+"#;
+
+    const CONSUMER_CC: &str = r#"
+#include <iostream>
+#include <string_view>
+
+void greet(std::string_view name);
+
+int main() {
+greet("Rust");
+return 0;
+}
+"#;
 
     const MAIN_CC: &str = r#"
 #include <iostream>
@@ -1159,21 +1181,35 @@ return 0;
 }
 "#;
 
+    static LOGGER: Once = Once::new();
+
+    fn init_logger() {
+        LOGGER.call_once(|| {
+            env_logger::init();
+        })
+    }
+
     fn temp_dir() -> anyhow::Result<TempDir> {
         Ok(tempfile::tempdir()?)
     }
 
-    fn temp_main_cc(temp_path: &Path) -> anyhow::Result<PathBuf> {
-        let path = temp_path.join("main.cc");
+    fn temp_cc(content: &str, name: &str, temp_path: &Path) -> anyhow::Result<PathBuf> {
+        let path = temp_path.join(name);
 
         let mut main_cc = std::fs::File::create(&path)?;
-        main_cc.write_all(MAIN_CC.as_bytes())?;
+        main_cc.write_all(content.as_bytes())?;
 
         Ok(path)
     }
 
+    fn temp_main_cc(temp_path: &Path) -> anyhow::Result<PathBuf> {
+        temp_cc(MAIN_CC, "main.cc", temp_path)
+    }
+
     #[tokio::test]
     async fn build() {
+        init_logger();
+
         let temp_dir = temp_dir().unwrap();
         let main_cc = temp_main_cc(temp_dir.path()).unwrap();
 
@@ -1207,6 +1243,8 @@ return 0;
 
     #[tokio::test]
     async fn compile() {
+        init_logger();
+
         let temp_dir = temp_dir().unwrap();
         let main_cc = temp_main_cc(temp_dir.path()).unwrap();
         let main_o = main_cc.with_extension("o");
@@ -1219,6 +1257,8 @@ return 0;
 
     #[tokio::test]
     async fn compile_and_archive() {
+        init_logger();
+
         let temp_dir = temp_dir().unwrap();
         let main_cc = temp_main_cc(temp_dir.path()).unwrap();
         let main_o = main_cc.with_extension("o");
@@ -1237,7 +1277,7 @@ return 0;
 
     #[tokio::test]
     async fn target_triple() {
-        env_logger::init();
+        init_logger();
 
         let llvm = LLVM::default().with_working_directory(std::env::current_dir().expect("cwd"));
         let cc_linux = llvm
@@ -1259,7 +1299,59 @@ return 0;
     }
 
     #[tokio::test]
+    async fn libtool_and_link() {
+        init_logger();
+
+        let temp_dir = temp_dir().unwrap();
+        let lib_cc = temp_cc(LIB_CC, "lib.cc", temp_dir.path()).unwrap();
+        let consumer_cc = temp_cc(CONSUMER_CC, "consumer.cc", temp_dir.path()).unwrap();
+
+        let dependency_map = DependencyMap::default();
+        let compiledb = CompileDB::default();
+
+        let llvm = LLVM::default().with_working_directory(temp_dir.path());
+
+        let mut lib_build = BuildBuilder::new(llvm.clone())
+            .with_sources(vec![lib_cc])
+            .with_type(crate::build::Type::StaticLibrary)
+            .with_compiledb(compiledb.clone())
+            .with_dependency_map(dependency_map.clone())
+            .with_cc_flags(vec!["-std=c++17".to_string()])
+            .with_build_directory(temp_dir.path())
+            .finish()
+            .expect("builder");
+
+        let lib = lib_build.build("greet").await.expect("build");
+
+        let mut consumer_build = BuildBuilder::new(llvm.clone())
+            .with_sources(vec![consumer_cc])
+            .with_compiledb(compiledb)
+            .with_dependency_map(dependency_map)
+            .with_libraries(Some(lib))
+            .with_cc_flags(vec!["-std=c++17".to_string()])
+            .with_build_directory(temp_dir.path())
+            .finish()
+            .expect("builder");
+
+        let bin = consumer_build.build("bin").await.expect("build");
+
+        for entry in walkdir::WalkDir::new(temp_dir.path())
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            log::debug!("{:?}", entry);
+        }
+
+        assert!(Command::new(temp_dir.path().join(bin))
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    #[tokio::test]
     async fn compile_and_link() {
+        init_logger();
+
         let temp_dir = temp_dir().unwrap();
         let main_cc = temp_main_cc(temp_dir.path()).unwrap();
         let main_o = main_cc.with_extension("o");

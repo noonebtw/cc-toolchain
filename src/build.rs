@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::llvm::OutputNameAffixes;
-use crate::traits::{Compiler, Linker};
+use crate::traits::{Archiver, Compiler, Linker};
 use crate::{compiledb::CompileDB, traits::Toolchain};
 
 use crate::dependency_map::{DependencyMap, DependencyMapExt};
@@ -113,28 +113,46 @@ where
         self
     }
 
-    pub fn with_cc_flags(mut self, cc_flags: Vec<String>) -> Self {
-        self.cc_flags.extend(cc_flags);
+    pub fn with_cc_flags<I>(mut self, cc_flags: I) -> Self
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.cc_flags.extend(cc_flags.into_iter());
         self
     }
 
-    pub fn with_ld_flags(mut self, ld_flags: Vec<String>) -> Self {
-        self.ld_flags.extend(ld_flags);
+    pub fn with_ld_flags<I>(mut self, ld_flags: I) -> Self
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.ld_flags.extend(ld_flags.into_iter());
         self
     }
 
-    pub fn with_libraries(mut self, libraries: Vec<PathBuf>) -> Self {
-        self.libraries.extend(libraries);
+    pub fn with_libraries<I, P>(mut self, libraries: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        self.libraries.extend(libraries.into_iter().map(Into::into));
         self
     }
 
-    pub fn with_defines(mut self, defines: Vec<String>) -> Self {
-        self.defines.extend(defines);
+    pub fn with_defines<I>(mut self, defines: I) -> Self
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.defines.extend(defines.into_iter());
         self
     }
 
-    pub fn with_sources(mut self, sources: Vec<PathBuf>) -> Self {
-        self.source_files.extend(sources);
+    pub fn with_sources<I, P>(mut self, sources: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        self.source_files
+            .extend(sources.into_iter().map(Into::into));
         self
     }
 
@@ -273,7 +291,7 @@ where
         )
     }
 
-    pub async fn build<S>(&mut self, output: S) -> anyhow::Result<()>
+    pub async fn build<S>(&mut self, output: S) -> anyhow::Result<PathBuf>
     where
         S: Into<String>,
     {
@@ -326,12 +344,6 @@ where
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
 
-        let ld = self
-            .toolchain
-            .linker()
-            .with_args(&self.ld_flags)
-            .with_libs_from_path(&self.libraries);
-
         let affixes = triple
             .await
             .map(|a| OutputNameAffixes::from(a.binary_format))?;
@@ -340,8 +352,34 @@ where
             self.output_directory
                 .join(Self::map_output_name(output, self.output_type, affixes));
 
-        // FIXME: add an actual output path here
-        Ok(ld.link(objects, output_path).await?)
+        match self.output_type {
+            Type::Executable => {
+                let ld = self
+                    .toolchain
+                    .linker()
+                    .with_args(&self.ld_flags)
+                    .with_libs_from_path(&self.libraries);
+
+                ld.link(objects, &output_path).await?;
+            }
+            Type::SharedLibrary => {
+                let ld = self
+                    .toolchain
+                    .linker()
+                    .with_shared()
+                    .with_args(&self.ld_flags)
+                    .with_libs_from_path(&self.libraries);
+
+                ld.link(objects, &output_path).await?;
+            }
+            Type::StaticLibrary => {
+                let libtool = self.toolchain.libtool().with_args(&self.ld_flags);
+
+                libtool.archive(objects, &output_path).await?;
+            }
+        }
+
+        Ok(output_path)
     }
 }
 
