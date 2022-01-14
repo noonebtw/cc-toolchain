@@ -1137,7 +1137,7 @@ mod tests {
         io::Write,
         path::{Path, PathBuf},
         process::Command,
-        sync::Once,
+        sync::{Arc, Once},
     };
 
     use target_lexicon::{Architecture, OperatingSystem, Triple};
@@ -1147,7 +1147,7 @@ mod tests {
         build::BuildBuilder,
         compiledb::CompileDB,
         dependency_map::DependencyMap,
-        llvm::{OutputNameAffixes, LLVM},
+        llvm::LLVM,
         traits::{Archiver, Compiler, Linker, Toolchain},
     };
 
@@ -1216,7 +1216,7 @@ return 0;
         let dependency_map = DependencyMap::default();
         let compiledb = CompileDB::default();
 
-        let llvm = LLVM::default().with_working_directory(temp_dir.path());
+        let llvm = Arc::new(LLVM::default().with_working_directory(temp_dir.path()));
         let mut build = BuildBuilder::new(llvm)
             .with_sources(vec![main_cc])
             .with_compiledb(compiledb)
@@ -1309,7 +1309,7 @@ return 0;
         let dependency_map = DependencyMap::default();
         let compiledb = CompileDB::default();
 
-        let llvm = LLVM::default().with_working_directory(temp_dir.path());
+        let llvm = Arc::new(LLVM::default().with_working_directory(temp_dir.path()));
 
         let mut lib_build = BuildBuilder::new(llvm.clone())
             .with_sources(vec![lib_cc])

@@ -129,6 +129,16 @@ where
         self
     }
 
+    pub fn with_include_directories<I, P>(mut self, include_directories: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        self.include_directories
+            .extend(include_directories.into_iter().map(Into::into));
+        self
+    }
+
     pub fn with_libraries<I, P>(mut self, libraries: I) -> Self
     where
         I: IntoIterator<Item = P>,
