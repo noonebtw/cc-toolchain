@@ -17,10 +17,10 @@ pub enum Type {
 
 pub struct Build<T>
 where
-    T: Toolchain + Send + Sync,
+    T: Toolchain,
 {
     /// toolchain used for compiling and linking the program
-    toolchain: T,
+    toolchain: Arc<T>,
     /// List of all source files included in the program. These paths have to be
     /// either absolute or relative to [build_directory](Self::build_directory).
     source_files: Vec<PathBuf>,
@@ -45,9 +45,9 @@ where
 #[derive(Debug)]
 pub struct BuildBuilder<T>
 where
-    T: Toolchain + Send + Sync,
+    T: Toolchain,
 {
-    toolchain: Option<T>,
+    toolchain: Option<Arc<T>>,
     source_files: Vec<PathBuf>,
     include_directories: Vec<PathBuf>,
     build_directory: Option<PathBuf>,
@@ -66,7 +66,7 @@ where
 
 impl<T> Default for BuildBuilder<T>
 where
-    T: Toolchain + Send + Sync,
+    T: Toolchain,
 {
     fn default() -> Self {
         Self {
@@ -91,9 +91,9 @@ where
 
 impl<T> BuildBuilder<T>
 where
-    T: Toolchain + Send + Sync,
+    T: Toolchain,
 {
-    pub fn new(toolchain: T) -> Self {
+    pub fn new(toolchain: Arc<T>) -> Self {
         Self {
             toolchain: Some(toolchain),
             ..Default::default()
@@ -252,7 +252,7 @@ where
 
 impl<T> Build<T>
 where
-    T: Toolchain + Send + Sync,
+    T: Toolchain,
 {
     async fn should_compile_file<P, C>(&self, file: P, cc: &C) -> bool
     where
@@ -382,6 +382,3 @@ where
         Ok(output_path)
     }
 }
-
-#[cfg(test)]
-mod tests {}
