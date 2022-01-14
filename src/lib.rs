@@ -27,10 +27,15 @@ pub mod traits {
     use crate::{
         compiledb::CompileDBEntry, dependency_map::DependencyMapEntry, error::ToolchainError,
     };
-    use std::{ffi::OsStr, path::Path};
+    use std::{
+        ffi::OsStr,
+        path::{Path, PathBuf},
+    };
 
     #[async_trait::async_trait]
     pub trait Compiler: Send + Sync {
+        fn with_working_directory<P: Into<PathBuf>>(self, working_directory: P) -> Self;
+
         fn with_arg<S>(self, arg: S) -> Self
         where
             S: AsRef<OsStr>;
@@ -78,6 +83,8 @@ pub mod traits {
 
     #[async_trait::async_trait]
     pub trait Linker: Send + Sync {
+        fn with_working_directory<P: Into<PathBuf>>(self, working_directory: P) -> Self;
+
         fn with_arg<S>(self, arg: S) -> Self
         where
             S: AsRef<OsStr>;
@@ -117,6 +124,8 @@ pub mod traits {
 
     #[async_trait::async_trait]
     pub trait Archiver: Send + Sync {
+        fn with_working_directory<P: Into<PathBuf>>(self, working_directory: P) -> Self;
+
         fn with_arg<S>(self, arg: S) -> Self
         where
             S: AsRef<OsStr>;
@@ -177,7 +186,6 @@ pub mod llvm {
     #![allow(dead_code)]
 
     use async_process::Command;
-    use futures::FutureExt;
     use futures::TryFutureExt;
     use rayon::iter::IntoParallelIterator;
     use rayon::iter::ParallelIterator;
@@ -257,8 +265,6 @@ pub mod llvm {
         archiver: PathBuf,
         #[serde(default)]
         default_ar_flags: Vec<OsString>,
-        #[serde(skip)]
-        working_directory: PathBuf,
     }
 
     impl Default for LLVM {
@@ -277,25 +283,12 @@ pub mod llvm {
                 #[cfg(target_os = "macos")]
                 archiver: which::which("llvm-libtool-darwin").expect("llvm-libtool-darwin"),
                 default_ar_flags: Default::default(),
-                working_directory: Default::default(),
-            }
-        }
-    }
-
-    impl LLVM {
-        pub fn with_working_directory<P>(self, working_directory: P) -> Self
-        where
-            P: Into<PathBuf>,
-        {
-            Self {
-                working_directory: working_directory.into(),
-                ..self
             }
         }
     }
 
     pub struct Clang {
-        working_directory: PathBuf,
+        working_directory: Option<PathBuf>,
         cc: PathBuf,
         flags: Vec<OsString>,
     }
@@ -308,11 +301,16 @@ pub mod llvm {
             self.flags.push(arg.as_ref().to_os_string());
         }
 
+        fn working_directory(&self) -> PathBuf {
+            self.working_directory
+                .clone()
+                .unwrap_or_else(|| std::env::current_dir().expect("cwd"))
+        }
+
         pub async fn target_triple(&self) -> Result<target_lexicon::Triple, ToolchainError> {
             let mut cc = Command::new(&self.cc);
             let output = cc
                 .args(&self.flags)
-                .current_dir(&self.working_directory)
                 .arg("--version")
                 .output()
                 .map_err(|e| {
@@ -358,7 +356,7 @@ pub mod llvm {
     #[derive(Debug, Default)]
     pub struct Libtool {
         family: LibtoolFamily,
-        working_directory: PathBuf,
+        working_directory: Option<PathBuf>,
         ar: PathBuf,
         flags: Vec<OsString>,
     }
@@ -390,13 +388,19 @@ pub mod llvm {
             }
         }
 
+        fn working_directory(&self) -> PathBuf {
+            self.working_directory
+                .clone()
+                .unwrap_or_else(|| std::env::current_dir().expect("cwd"))
+        }
+
         pub fn with_default_flags(self, flags: Vec<OsString>) -> Self {
             Self { flags, ..self }
         }
 
         pub fn with_cwd<P: AsRef<Path>>(self, path: P) -> Self {
             Self {
-                working_directory: path.as_ref().to_owned(),
+                working_directory: Some(path.as_ref().to_owned()),
                 ..self
             }
         }
@@ -410,7 +414,7 @@ pub mod llvm {
     }
 
     pub struct Lld {
-        working_directory: PathBuf,
+        working_directory: Option<PathBuf>,
         lld: PathBuf,
         flags: Vec<OsString>,
     }
@@ -422,6 +426,12 @@ pub mod llvm {
         {
             self.flags.push(arg.as_ref().to_owned());
         }
+
+        fn working_directory(&self) -> PathBuf {
+            self.working_directory
+                .clone()
+                .unwrap_or_else(|| std::env::current_dir().expect("cwd"))
+        }
     }
 
     impl Toolchain for LLVM {
@@ -431,7 +441,7 @@ pub mod llvm {
 
         fn compiler(&self) -> Self::Compiler {
             Clang {
-                working_directory: self.working_directory.clone(),
+                working_directory: None,
                 cc: self.compiler.clone(),
                 flags: self.default_cc_flags.clone(),
             }
@@ -439,16 +449,14 @@ pub mod llvm {
 
         fn linker(&self) -> Self::Linker {
             Lld {
-                working_directory: self.working_directory.clone(),
+                working_directory: None,
                 lld: self.compiler.clone(),
                 flags: self.default_ld_flags.clone(),
             }
         }
 
         fn libtool(&self) -> Self::Archiver {
-            Libtool::new(&self.archiver)
-                .with_cwd(&self.working_directory)
-                .with_default_flags(self.default_ar_flags.clone())
+            Libtool::new(&self.archiver).with_default_flags(self.default_ar_flags.clone())
         }
     }
 
@@ -528,8 +536,9 @@ pub mod llvm {
             );
 
             let mut cc = Command::new(&self.cc);
+
             cc.args(&self.flags)
-                .current_dir(&self.working_directory)
+                .current_dir(self.working_directory())
                 .arg("-o")
                 .arg(output.as_ref())
                 .arg("-c")
@@ -553,7 +562,10 @@ pub mod llvm {
                     let input_string = input.as_ref().to_string_lossy().to_string();
 
                     CompileDBEntry {
-                        directory: Some(self.working_directory.to_string_lossy().to_string()),
+                        directory: self
+                            .working_directory
+                            .as_ref()
+                            .map(|cwd| cwd.to_string_lossy().to_string()),
                         file: input_string.clone(),
                         arguments: None,
                         command: Some(format!(
@@ -578,9 +590,10 @@ pub mod llvm {
         {
             let input_path = input.as_ref().to_owned();
 
-            Command::new(&self.cc)
-                .current_dir(&self.working_directory)
-                .args(&self.flags)
+            let mut cc = Command::new(&self.cc);
+
+            cc.args(&self.flags)
+                .current_dir(self.working_directory())
                 .args(["-MM", "-MF", "-"])
                 .arg(input.as_ref())
                 .output()
@@ -644,7 +657,7 @@ pub mod llvm {
                             } else {
                                 RelativePathBuf::from_path(&path)
                                     .unwrap()
-                                    .to_logical_path(&self.working_directory)
+                                    .to_logical_path(self.working_directory())
                             };
 
                             path.metadata()
@@ -673,6 +686,13 @@ pub mod llvm {
             self
         }
 
+        fn with_working_directory<P: Into<PathBuf>>(self, working_directory: P) -> Self {
+            Self {
+                working_directory: Some(working_directory.into()),
+                ..self
+            }
+        }
+
         async fn target_triple(&self) -> Result<target_lexicon::Triple, ToolchainError> {
             Self::target_triple(self).await
         }
@@ -680,6 +700,13 @@ pub mod llvm {
 
     #[async_trait::async_trait]
     impl Linker for Lld {
+        fn with_working_directory<P: Into<PathBuf>>(self, working_directory: P) -> Self {
+            Self {
+                working_directory: Some(working_directory.into()),
+                ..self
+            }
+        }
+
         fn with_arg<S>(mut self, arg: S) -> Self
         where
             S: AsRef<OsStr>,
@@ -775,7 +802,7 @@ pub mod llvm {
             log::debug!("ld: {:?} {:?}", self.lld, self.flags);
 
             let mut lld = Command::new(&self.lld);
-            lld.current_dir(&self.working_directory)
+            lld.current_dir(self.working_directory())
                 .args(&self.flags)
                 .arg("-o")
                 .arg(output)
@@ -797,6 +824,13 @@ pub mod llvm {
 
     #[async_trait::async_trait]
     impl Archiver for Libtool {
+        fn with_working_directory<P: Into<PathBuf>>(self, working_directory: P) -> Self {
+            Self {
+                working_directory: Some(working_directory.into()),
+                ..self
+            }
+        }
+
         fn with_arg<S>(mut self, arg: S) -> Self
         where
             S: AsRef<OsStr>,
@@ -825,7 +859,7 @@ pub mod llvm {
             log::debug!("libtool: {:?}", self.flags);
 
             let mut libtool = Command::new(&self.ar);
-            libtool.current_dir(&self.working_directory);
+            libtool.current_dir(self.working_directory());
 
             match self.family {
                 LibtoolFamily::Ar => {
@@ -1216,7 +1250,7 @@ return 0;
         let dependency_map = DependencyMap::default();
         let compiledb = CompileDB::default();
 
-        let llvm = Arc::new(LLVM::default().with_working_directory(temp_dir.path()));
+        let llvm = Arc::new(LLVM::default());
         let mut build = BuildBuilder::new(llvm)
             .with_sources(vec![main_cc])
             .with_compiledb(compiledb)
@@ -1249,9 +1283,12 @@ return 0;
         let main_cc = temp_main_cc(temp_dir.path()).unwrap();
         let main_o = main_cc.with_extension("o");
 
-        let llvm = LLVM::default().with_working_directory(temp_dir.path());
+        let llvm = LLVM::default();
 
-        let cc = llvm.compiler().with_cpp_version("c++17");
+        let cc = llvm
+            .compiler()
+            .with_working_directory(temp_dir.path())
+            .with_cpp_version("c++17");
         let _compiledb = cc.compile(main_cc, main_o).await.expect("compile");
     }
 
@@ -1264,9 +1301,13 @@ return 0;
         let main_o = main_cc.with_extension("o");
         let main_lib = main_cc.with_extension("lib");
 
-        let llvm = LLVM::default().with_working_directory(temp_dir.path());
+        let llvm = LLVM::default();
 
-        let cc = llvm.compiler().with_cpp_version("c++17").with_arg("-flto");
+        let cc = llvm
+            .compiler()
+            .with_working_directory(temp_dir.path())
+            .with_cpp_version("c++17")
+            .with_arg("-flto");
         let _compiledb = cc.compile(&main_cc, &main_o).await.expect("compile");
 
         llvm.libtool()
@@ -1279,7 +1320,7 @@ return 0;
     async fn target_triple() {
         init_logger();
 
-        let llvm = LLVM::default().with_working_directory(std::env::current_dir().expect("cwd"));
+        let llvm = LLVM::default();
         let cc_linux = llvm
             .compiler()
             .with_arg("--target=x86_64-linux-gnu")
@@ -1309,7 +1350,7 @@ return 0;
         let dependency_map = DependencyMap::default();
         let compiledb = CompileDB::default();
 
-        let llvm = Arc::new(LLVM::default().with_working_directory(temp_dir.path()));
+        let llvm = Arc::new(LLVM::default());
 
         let mut lib_build = BuildBuilder::new(llvm.clone())
             .with_sources(vec![lib_cc])
@@ -1357,9 +1398,13 @@ return 0;
         let main_o = main_cc.with_extension("o");
         let main_out = main_cc.with_extension("out");
 
-        let llvm = LLVM::default().with_working_directory(temp_dir.path());
+        let llvm = LLVM::default();
 
-        let cc = llvm.compiler().with_cpp_version("c++17").with_arg("-flto");
+        let cc = llvm
+            .compiler()
+            .with_working_directory(temp_dir.path())
+            .with_cpp_version("c++17")
+            .with_arg("-flto");
         let _compiledb = cc.compile(&main_cc, &main_o).await.expect("compile");
 
         llvm.linker()
