@@ -588,6 +588,8 @@ pub mod llvm {
         where
             P: AsRef<Path> + Send + Sync,
         {
+            log::debug!("cc dependencies: {:?}", input.as_ref());
+
             let input_path = input.as_ref().to_owned();
 
             let mut cc = Command::new(&self.cc);
@@ -640,7 +642,8 @@ pub mod llvm {
                                     );
                                 }
                             }
-                            out
+
+                            out.trim().to_string()
                         });
                     }
                     out.into_iter()
@@ -659,6 +662,8 @@ pub mod llvm {
                                     .unwrap()
                                     .to_logical_path(self.working_directory())
                             };
+
+                            log::debug!("{:?}", path);
 
                             path.metadata()
                                 .and_then(|meta| meta.modified())
@@ -915,7 +920,7 @@ pub mod dependency_map {
         fn from_path<P>(path: P) -> anyhow::Result<Self>
         where
             P: AsRef<Path>;
-        fn to_path<P>(self, path: P) -> anyhow::Result<()>
+        fn to_path<P>(&self, path: P) -> anyhow::Result<()>
         where
             P: AsRef<Path>;
 
@@ -934,7 +939,7 @@ pub mod dependency_map {
             Ok(bincode::deserialize::<Self>(&contents)?)
         }
 
-        fn to_path<P>(self, path: P) -> anyhow::Result<()>
+        fn to_path<P>(&self, path: P) -> anyhow::Result<()>
         where
             P: AsRef<Path>,
         {
@@ -944,7 +949,9 @@ pub mod dependency_map {
         }
 
         fn contains_eq_entry(&self, entry: &DependencyMapEntry) -> bool {
-            self.get(entry).map(|ele| ele == entry).unwrap_or(false)
+            self.get(entry.file.as_path())
+                .map(|ele| ele == entry)
+                .unwrap_or(false)
         }
     }
 

@@ -1,4 +1,6 @@
 #![allow(dead_code)]
+use std::borrow::{Borrow, BorrowMut};
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -15,10 +17,7 @@ pub enum Type {
     StaticLibrary,
 }
 
-pub struct Build<T>
-where
-    T: Toolchain,
-{
+pub struct Build<T> {
     /// toolchain used for compiling and linking the program
     toolchain: Arc<T>,
     /// List of all source files included in the program. These paths have to be
@@ -43,10 +42,7 @@ where
 }
 
 #[derive(Debug)]
-pub struct BuildBuilder<T>
-where
-    T: Toolchain,
-{
+pub struct BuildBuilder<T> {
     toolchain: Option<Arc<T>>,
     source_files: Vec<PathBuf>,
     include_directories: Vec<PathBuf>,
@@ -64,10 +60,7 @@ where
     dependency_map: Option<DependencyMap>,
 }
 
-impl<T> Default for BuildBuilder<T>
-where
-    T: Toolchain,
-{
+impl<T> Default for BuildBuilder<T> {
     fn default() -> Self {
         Self {
             toolchain: None,
@@ -220,6 +213,14 @@ where
         }
     }
 
+    pub fn finish_wrapper(self) -> anyhow::Result<BuildWrapper<T>> {
+        Ok(BuildWrapper {
+            compilddb_path: self.compiledb_path.clone(),
+            dependency_map_path: self.dependency_map_path.clone(),
+            build: self.finish()?,
+        })
+    }
+
     pub fn finish(self) -> anyhow::Result<Build<T>> {
         let build_directory = self.build_directory.expect("build directory");
         let output_directory = self
@@ -237,9 +238,7 @@ where
         let dependency_map = match self.dependency_map {
             Some(dependency_map) => dependency_map,
             None => match self.dependency_map_path.as_ref() {
-                Some(path) => {
-                    DependencyMap::from_path(output_directory.join(path)).unwrap_or_default()
-                }
+                Some(path) => DependencyMap::from_path(path).unwrap_or_default(),
                 None => DependencyMap::default(),
             },
         };
@@ -259,6 +258,47 @@ where
             dependency_map,
             output_directory,
         })
+    }
+}
+
+pub struct BuildWrapper<T> {
+    build: Build<T>,
+    compilddb_path: Option<PathBuf>,
+    dependency_map_path: Option<PathBuf>,
+}
+
+impl<T> Drop for BuildWrapper<T> {
+    fn drop(&mut self) {
+        self.compilddb_path
+            .as_ref()
+            .map(|path| self.build.compiledb().to_path(path));
+        self.dependency_map_path
+            .as_ref()
+            .map(|path| self.build.dependency_map().to_path(path));
+    }
+}
+
+impl<T> Deref for BuildWrapper<T> {
+    type Target = Build<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.build
+    }
+}
+
+impl<T> DerefMut for BuildWrapper<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.build
+    }
+}
+
+impl<T> Build<T> {
+    pub fn compiledb(&self) -> &CompileDB {
+        &self.compiledb
+    }
+
+    pub fn dependency_map(&self) -> &DependencyMap {
+        &self.dependency_map
     }
 }
 
@@ -307,13 +347,17 @@ where
     where
         S: Into<String>,
     {
-        let cc = self
+        let mut cc = self
             .toolchain
             .compiler()
             .with_working_directory(&self.build_directory)
             .with_include_dirs(&self.include_directories)
             .with_defines(&self.defines)
             .with_args(&self.cc_flags);
+
+        if let Some(standard) = self.cpp_standard.as_ref() {
+            cc = cc.with_cpp_version(standard);
+        }
 
         let triple = cc.target_triple();
 
@@ -338,9 +382,12 @@ where
                 match result {
                     Ok((input, output, deps)) => {
                         let should_compile =
-                            dependency_map.lock().unwrap().contains_eq_entry(&deps);
+                            !dependency_map.lock().unwrap().contains_eq_entry(&deps);
 
-                        if !output.exists() || should_compile {
+                        let output_exists = self.build_directory.join(&output).exists();
+
+                        if !output_exists || should_compile {
+                            log::debug!("exists: {}, recompile: {}", output_exists, should_compile);
                             let compiledb_entry = cc.compile(input, &output).await?;
 
                             compiledb.lock().unwrap().0.replace(compiledb_entry);
