@@ -331,7 +331,16 @@ pub mod llvm {
                     output
                         .lines()
                         .find_map(|line| line.strip_prefix("Target: "))
-                        .map(|triple| Triple::from_str(triple))
+                        .map(|line| {
+                            line.chars()
+                                .rev()
+                                .skip_while(|c| c.is_numeric() || c == &'.')
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev()
+                                .collect::<String>()
+                        })
+                        .map(|triple| Triple::from_str(&triple))
                 })?;
 
             Ok(output
@@ -1181,7 +1190,7 @@ mod tests {
         sync::{Arc, Once},
     };
 
-    use target_lexicon::{Architecture, OperatingSystem, Triple};
+    use target_lexicon::{Architecture, Environment, OperatingSystem, Triple, Vendor};
     use tempfile::TempDir;
 
     use crate::{
@@ -1344,6 +1353,21 @@ return 0;
         let triple = cc_host.target_triple().await.expect("triple");
 
         assert_eq!(triple, Triple::host());
+    }
+
+    #[tokio::test]
+    async fn appleclang_triple() {
+        init_logger();
+
+        let llvm = LLVM::default();
+        let appleclang = llvm
+            .compiler()
+            .with_arg("--target=x86_64-apple-darwin20.6.0");
+
+        let triple = appleclang.target_triple().await.expect("triple");
+
+        assert_eq!(triple.architecture, Architecture::X86_64);
+        assert_eq!(triple.vendor, Vendor::Apple);
     }
 
     #[tokio::test]
