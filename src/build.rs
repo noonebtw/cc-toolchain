@@ -310,6 +310,7 @@ where
         let cc = self
             .toolchain
             .compiler()
+            .with_working_directory(&self.build_directory)
             .with_include_dirs(&self.include_directories)
             .with_defines(&self.defines)
             .with_args(&self.cc_flags);
@@ -369,6 +370,7 @@ where
                 let ld = self
                     .toolchain
                     .linker()
+                    .with_working_directory(&self.build_directory)
                     .with_args(&self.ld_flags)
                     .with_libs_from_path(&self.libraries);
 
@@ -378,6 +380,7 @@ where
                 let ld = self
                     .toolchain
                     .linker()
+                    .with_working_directory(&self.build_directory)
                     .with_shared()
                     .with_args(&self.ld_flags)
                     .with_libs_from_path(&self.libraries);
@@ -385,7 +388,11 @@ where
                 ld.link(objects, &output_path).await?;
             }
             Type::StaticLibrary => {
-                let libtool = self.toolchain.libtool().with_args(&self.ld_flags);
+                let libtool = self
+                    .toolchain
+                    .libtool()
+                    .with_working_directory(&self.build_directory)
+                    .with_args(&self.ld_flags);
 
                 libtool.archive(objects, &output_path).await?;
             }
