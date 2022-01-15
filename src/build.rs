@@ -229,7 +229,7 @@ where
         let compiledb = match self.compiledb {
             Some(compiledb) => compiledb,
             None => match self.compiledb_path.as_ref() {
-                Some(path) => CompileDB::from_path(path)?,
+                Some(path) => CompileDB::from_path(path).unwrap_or_default(),
                 None => CompileDB::default(),
             },
         };
@@ -237,7 +237,9 @@ where
         let dependency_map = match self.dependency_map {
             Some(dependency_map) => dependency_map,
             None => match self.dependency_map_path.as_ref() {
-                Some(path) => DependencyMap::from_path(output_directory.join(path))?,
+                Some(path) => {
+                    DependencyMap::from_path(output_directory.join(path)).unwrap_or_default()
+                }
                 None => DependencyMap::default(),
             },
         };
