@@ -1,9 +1,12 @@
 #![allow(dead_code)]
-use std::borrow::{Borrow, BorrowMut};
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use futures::future::join_all;
+use futures::FutureExt;
+
+use crate::error::ToolchainError;
 use crate::llvm::OutputNameAffixes;
 use crate::traits::{Archiver, Compiler, Linker};
 use crate::{compiledb::CompileDB, traits::Toolchain};
@@ -367,39 +370,40 @@ where
         let dependency_map = Arc::new(Mutex::new(&mut self.dependency_map));
 
         let objects = futures::stream::iter(self.source_files.iter().cloned())
-            .then(|source| async {
-                let rel = relative_path::RelativePath::from_path(&source)
-                    .map(|rel| rel.as_str())
-                    .unwrap_or(&source.to_str().expect("path"));
-                let digest = md5::compute(rel);
-                let output = self.output_directory.join(format!("{:x}.o", digest));
+            .map(|input| async {
+                let output = {
+                    let rel = relative_path::RelativePath::from_path(&input)
+                        .map(|rel| rel.as_str())
+                        .unwrap_or(&input.to_str().expect("path"));
+                    let digest = md5::compute(rel);
 
-                let dependencies = cc.dependencies(&source);
+                    self.output_directory.join(format!("{:x}.o", digest))
+                };
 
-                dependencies.await.map(move |deps| (source, output, deps))
-            })
-            .then(|result| async {
-                match result {
-                    Ok((input, output, deps)) => {
-                        let should_compile =
-                            !dependency_map.lock().unwrap().contains_eq_entry(&deps);
+                let dependencies = cc.dependencies(input.clone()).map(|deps| async {
+                    let deps = deps?;
+                    let should_compile = !dependency_map.lock().unwrap().contains_eq_entry(&deps);
 
-                        let output_exists = self.build_directory.join(&output).exists();
+                    let output_exists = self.build_directory.join(&output).exists();
 
-                        if !output_exists || should_compile {
-                            log::debug!("exists: {}, recompile: {}", output_exists, should_compile);
-                            let compiledb_entry = cc.compile(input, &output).await?;
+                    if !output_exists || should_compile {
+                        log::debug!("exists: {}, recompile: {}", output_exists, should_compile);
+                        let compiledb_entry = cc.compile(input, &output).await?;
 
-                            compiledb.lock().unwrap().0.replace(compiledb_entry);
-                            dependency_map.lock().unwrap().replace(deps);
-                        }
-
-                        Ok(output)
+                        compiledb.lock().unwrap().0.replace(compiledb_entry);
+                        dependency_map.lock().unwrap().replace(deps);
                     }
-                    Err(e) => Err(e),
-                }
+
+                    Ok::<_, ToolchainError>(output)
+                });
+
+                dependencies.await
             })
+            .buffer_unordered(10)
             .collect::<Vec<_>>()
+            .await;
+
+        let objects: Vec<_> = join_all(objects)
             .await
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
@@ -421,7 +425,7 @@ where
                     .with_args(&self.ld_flags)
                     .with_libs_from_path(&self.libraries);
 
-                ld.link(objects, &output_path).await?;
+                ld.link(objects, output_path.as_path()).await?;
             }
             Type::SharedLibrary => {
                 let ld = self
