@@ -11,7 +11,7 @@ use crate::llvm::OutputNameAffixes;
 use crate::traits::{Archiver, Compiler, Linker};
 use crate::{compiledb::CompileDB, traits::Toolchain};
 
-use crate::dependency_map::{DependencyMap, DependencyMapExt};
+use crate::dependency_map::{DependencyMap, DependencyMapEntry, DependencyMapExt};
 
 #[derive(Debug, Clone, Copy)]
 pub enum Type {
@@ -416,37 +416,50 @@ where
             self.output_directory
                 .join(Self::map_output_name(output, self.output_type, affixes));
 
-        match self.output_type {
-            Type::Executable => {
-                let ld = self
-                    .toolchain
-                    .linker()
-                    .with_working_directory(&self.build_directory)
-                    .with_args(&self.ld_flags)
-                    .with_libs_from_path(&self.libraries);
+        let link_dependencies = DependencyMapEntry::new_from_files(
+            &output_path,
+            objects.iter().map(|path| self.build_directory.join(path)),
+        )?;
 
-                ld.link(objects, output_path.as_path()).await?;
-            }
-            Type::SharedLibrary => {
-                let ld = self
-                    .toolchain
-                    .linker()
-                    .with_working_directory(&self.build_directory)
-                    .with_shared()
-                    .with_args(&self.ld_flags)
-                    .with_libs_from_path(&self.libraries);
+        if !dependency_map
+            .lock()
+            .unwrap()
+            .contains_eq_entry(&link_dependencies)
+        {
+            match self.output_type {
+                Type::Executable => {
+                    let ld = self
+                        .toolchain
+                        .linker()
+                        .with_working_directory(&self.build_directory)
+                        .with_args(&self.ld_flags)
+                        .with_libs_from_path(&self.libraries);
 
-                ld.link(objects, &output_path).await?;
-            }
-            Type::StaticLibrary => {
-                let libtool = self
-                    .toolchain
-                    .libtool()
-                    .with_working_directory(&self.build_directory)
-                    .with_args(&self.ld_flags);
+                    ld.link(objects, output_path.as_path()).await?;
+                }
+                Type::SharedLibrary => {
+                    let ld = self
+                        .toolchain
+                        .linker()
+                        .with_working_directory(&self.build_directory)
+                        .with_shared()
+                        .with_args(&self.ld_flags)
+                        .with_libs_from_path(&self.libraries);
 
-                libtool.archive(objects, &output_path).await?;
+                    ld.link(objects, &output_path).await?;
+                }
+                Type::StaticLibrary => {
+                    let libtool = self
+                        .toolchain
+                        .libtool()
+                        .with_working_directory(&self.build_directory)
+                        .with_args(&self.ld_flags);
+
+                    libtool.archive(objects, &output_path).await?;
+                }
             }
+
+            dependency_map.lock().unwrap().replace(link_dependencies);
         }
 
         Ok(output_path)
