@@ -689,7 +689,15 @@ pub mod llvm {
                             )
                         })
                 })
-                .map(|dependencies| DependencyMapEntry::new(input.as_ref(), dependencies))
+                .map(|dependencies| {
+                    DependencyMapEntry::new(
+                        input.as_ref(),
+                        self.flags
+                            .iter()
+                            .map(|arg| arg.to_string_lossy().to_string()),
+                        dependencies,
+                    )
+                })
         }
 
         fn with_cpp_version<CppStandard>(mut self, cpp: CppStandard) -> Self
@@ -914,7 +922,7 @@ pub mod llvm {
 pub mod dependency_map {
     use std::{
         borrow::Borrow,
-        collections::{BTreeMap, HashSet},
+        collections::{BTreeMap, BTreeSet, HashSet},
         hash::Hash,
         io::{Read, Write},
         path::{Path, PathBuf},
@@ -967,6 +975,7 @@ pub mod dependency_map {
     #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Clone)]
     pub struct DependencyMapEntry {
         file: PathBuf,
+        cc_flags: BTreeSet<String>,
         dependencies: BTreeMap<PathBuf, SystemTime>,
     }
 
@@ -983,12 +992,14 @@ pub mod dependency_map {
     }
 
     impl DependencyMapEntry {
-        pub fn new<P>(file: P, dependencies: BTreeMap<PathBuf, SystemTime>) -> Self
+        pub fn new<P, I>(file: P, cc_flags: I, dependencies: BTreeMap<PathBuf, SystemTime>) -> Self
         where
             P: Into<PathBuf>,
+            I: IntoIterator<Item = String>,
         {
             Self {
                 file: file.into(),
+                cc_flags: cc_flags.into_iter().collect(),
                 dependencies,
             }
         }
@@ -1011,6 +1022,7 @@ pub mod dependency_map {
 
             Ok(Self {
                 file: for_file.as_ref().to_path_buf(),
+                cc_flags: Default::default(),
                 dependencies,
             })
         }
