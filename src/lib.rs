@@ -935,6 +935,7 @@ pub mod dependency_map {
         time::SystemTime,
     };
 
+    use itertools::Itertools;
     use serde::{Deserialize, Serialize};
 
     pub type DependencyMap = HashSet<DependencyMapEntry>;
@@ -1010,6 +1011,18 @@ pub mod dependency_map {
     }
 
     impl DependencyMapEntry {
+        pub fn has_changed(&self) -> std::io::Result<bool> {
+            Ok(self
+                .dependencies
+                .iter()
+                .map(|(path, saved_modified)| {
+                    path.metadata()
+                        .and_then(|meta| meta.modified())
+                        .map(|last_modified| &last_modified == saved_modified)
+                })
+                .fold_ok(true, |sum, changed| sum && changed)?)
+        }
+
         pub fn new<P, I>(file: P, cc_flags: I, dependencies: BTreeMap<PathBuf, SystemTime>) -> Self
         where
             P: Into<PathBuf>,
@@ -1220,7 +1233,7 @@ mod tests {
         sync::{Arc, Once},
     };
 
-    use target_lexicon::{Architecture, Environment, OperatingSystem, Triple, Vendor};
+    use target_lexicon::{Architecture, OperatingSystem, Triple, Vendor};
     use tempfile::TempDir;
 
     use crate::{

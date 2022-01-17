@@ -384,16 +384,33 @@ where
             (input, output)
         }))
         .map(|(input, output)| async {
-            log::info!("checking {}..", input.display());
-            let deps = cc.dependencies(input.clone()).await?;
+            let skip_compiling = dependency_map
+                .lock()
+                .unwrap()
+                .get(input.as_path())
+                .and_then(|deps| deps.has_changed().ok())
+                .unwrap_or(false);
 
-            let should_compile = !dependency_map.lock().unwrap().contains_eq_entry(&deps);
             let output_exists = self.build_directory.join(&output).exists();
 
-            if !output_exists || should_compile {
-                log::debug!("exists: {}, recompile: {}", output_exists, should_compile);
-                log::info!("{}", input.display());
+            if !(output_exists && skip_compiling) {
+                log::debug!(
+                    "exists: {}, skip_compiling: {}",
+                    output_exists,
+                    skip_compiling
+                );
+                log::info!(
+                    "{} {}..",
+                    if output_exists {
+                        "recompiling"
+                    } else {
+                        "compiling"
+                    },
+                    input.display()
+                );
 
+                let start = std::time::Instant::now();
+                let deps = cc.dependencies(input.clone()).await?;
                 let compiledb_entry = cc.compile(input, &output).await?;
 
                 compiledb.lock().unwrap().0.replace(compiledb_entry);
@@ -403,6 +420,7 @@ where
                     .unwrap()
                     .remove(Borrow::<std::path::Path>::borrow(&deps));
                 dependency_map.lock().unwrap().insert(deps);
+                log::info!("took [{:.2}s]", start.elapsed().as_secs_f32());
             }
 
             Ok::<_, ToolchainError>(output)
