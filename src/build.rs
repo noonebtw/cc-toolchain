@@ -1,10 +1,13 @@
 #![allow(dead_code)]
+use std::borrow::Borrow;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use futures::future::join_all;
-use futures::FutureExt;
+use futures::{FutureExt, TryFutureExt};
+use itertools::Itertools;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::error::ToolchainError;
 use crate::llvm::OutputNameAffixes;
@@ -369,44 +372,46 @@ where
         let compiledb = Arc::new(Mutex::new(&mut self.compiledb));
         let dependency_map = Arc::new(Mutex::new(&mut self.dependency_map));
 
-        let objects = futures::stream::iter(self.source_files.iter().cloned())
-            .map(|input| async {
-                let output = {
-                    let rel = relative_path::RelativePath::from_path(&input)
-                        .map(|rel| rel.as_str())
-                        .unwrap_or(&input.to_str().expect("path"));
-                    let digest = md5::compute(rel);
+        let objects = futures::stream::iter(self.source_files.iter().cloned().map(|input| {
+            let output = {
+                let rel = relative_path::RelativePath::from_path(&input)
+                    .map(|rel| rel.as_str())
+                    .unwrap_or(&input.to_str().expect("path"));
+                let digest = md5::compute(rel);
 
-                    self.output_directory.join(format!("{:x}.o", digest))
-                };
+                self.output_directory.join(format!("{:x}.o", digest))
+            };
+            (input, output)
+        }))
+        .map(|(input, output)| async {
+            log::info!("checking {}..", input.display());
+            let deps = cc.dependencies(input.clone()).await?;
 
-                let dependencies = cc.dependencies(input.clone()).map(|deps| async {
-                    let deps = deps?;
-                    let should_compile = !dependency_map.lock().unwrap().contains_eq_entry(&deps);
+            let should_compile = !dependency_map.lock().unwrap().contains_eq_entry(&deps);
+            let output_exists = self.build_directory.join(&output).exists();
 
-                    let output_exists = self.build_directory.join(&output).exists();
+            if !output_exists || should_compile {
+                log::debug!("exists: {}, recompile: {}", output_exists, should_compile);
+                log::info!("{}", input.display());
 
-                    if !output_exists || should_compile {
-                        log::debug!("exists: {}, recompile: {}", output_exists, should_compile);
-                        let compiledb_entry = cc.compile(input, &output).await?;
+                let compiledb_entry = cc.compile(input, &output).await?;
 
-                        compiledb.lock().unwrap().0.replace(compiledb_entry);
-                        dependency_map.lock().unwrap().replace(deps);
-                    }
+                compiledb.lock().unwrap().0.replace(compiledb_entry);
 
-                    Ok::<_, ToolchainError>(output)
-                });
+                dependency_map
+                    .lock()
+                    .unwrap()
+                    .remove(Borrow::<std::path::Path>::borrow(&deps));
+                dependency_map.lock().unwrap().insert(deps);
+            }
 
-                dependencies.await
-            })
-            .buffer_unordered(10)
-            .collect::<Vec<_>>()
-            .await;
+            Ok::<_, ToolchainError>(output)
+        })
+        .buffer_unordered(4)
+        .collect::<Vec<_>>()
+        .await;
 
-        let objects: Vec<_> = join_all(objects)
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
+        let objects: Vec<_> = objects.into_iter().try_collect()?;
 
         let affixes = triple
             .await

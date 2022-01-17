@@ -310,6 +310,7 @@ pub mod llvm {
         pub async fn target_triple(&self) -> Result<target_lexicon::Triple, ToolchainError> {
             let mut cc = Command::new(&self.cc);
             let output = cc
+                .kill_on_drop(true)
                 .args(&self.flags)
                 .arg("--version")
                 .output()
@@ -547,6 +548,7 @@ pub mod llvm {
             let mut cc = Command::new(&self.cc);
 
             cc.args(&self.flags)
+                .kill_on_drop(true)
                 .current_dir(self.working_directory())
                 .arg("-o")
                 .arg(output.as_ref())
@@ -604,6 +606,7 @@ pub mod llvm {
             let mut cc = Command::new(&self.cc);
 
             cc.args(&self.flags)
+                .kill_on_drop(true)
                 .current_dir(self.working_directory())
                 .args(["-MM", "-MF", "-"])
                 .arg(input.as_ref())
@@ -825,6 +828,7 @@ pub mod llvm {
 
             let mut lld = Command::new(&self.lld);
             lld.current_dir(self.working_directory())
+                .kill_on_drop(true)
                 .args(&self.flags)
                 .arg("-o")
                 .arg(output)
@@ -881,7 +885,9 @@ pub mod llvm {
             log::debug!("libtool: {:?}", self.flags);
 
             let mut libtool = Command::new(&self.ar);
-            libtool.current_dir(self.working_directory());
+            libtool
+                .kill_on_drop(true)
+                .current_dir(self.working_directory());
 
             match self.family {
                 LibtoolFamily::Ar => {
@@ -922,7 +928,7 @@ pub mod llvm {
 pub mod dependency_map {
     use std::{
         borrow::Borrow,
-        collections::{BTreeMap, BTreeSet, HashSet},
+        collections::{BTreeMap, HashSet},
         hash::Hash,
         io::{Read, Write},
         path::{Path, PathBuf},
@@ -967,16 +973,28 @@ pub mod dependency_map {
 
         fn contains_eq_entry(&self, entry: &DependencyMapEntry) -> bool {
             self.get(entry.file.as_path())
-                .map(|ele| ele == entry)
+                .map(|ele| {
+                    log::debug!("found dependency entry in map\n{:#?} == {:#?}", ele, entry);
+                    ele == entry
+                })
                 .unwrap_or(false)
         }
     }
 
-    #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Clone)]
+    #[derive(Debug, Deserialize, Serialize, Eq, Clone)]
     pub struct DependencyMapEntry {
         file: PathBuf,
-        cc_flags: BTreeSet<String>,
+        cc_flags: Vec<String>,
         dependencies: BTreeMap<PathBuf, SystemTime>,
+    }
+
+    impl PartialEq for DependencyMapEntry {
+        fn eq(&self, other: &Self) -> bool {
+            self.file == other.file
+                && self.cc_flags.iter().collect::<HashSet<_>>()
+                    == other.cc_flags.iter().collect::<HashSet<_>>()
+                && self.dependencies == other.dependencies
+        }
     }
 
     impl Borrow<Path> for DependencyMapEntry {
