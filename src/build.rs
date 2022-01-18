@@ -384,6 +384,7 @@ where
             (input, output)
         }))
         .map(|(input, output)| async {
+            let input = input;
             let skip_compiling = dependency_map
                 .lock()
                 .unwrap()
@@ -411,7 +412,7 @@ where
 
                 let start = std::time::Instant::now();
                 let deps = cc.dependencies(input.clone()).await?;
-                let compiledb_entry = cc.compile(input, &output).await?;
+                let compiledb_entry = cc.compile(&input, &output).await?;
 
                 compiledb.lock().unwrap().0.replace(compiledb_entry);
 
@@ -420,7 +421,11 @@ where
                     .unwrap()
                     .remove(Borrow::<std::path::Path>::borrow(&deps));
                 dependency_map.lock().unwrap().insert(deps);
-                log::info!("took [{:.2}s]", start.elapsed().as_secs_f32());
+                log::info!(
+                    "{} [{:.2}s]",
+                    input.display(),
+                    start.elapsed().as_secs_f32()
+                );
             }
 
             Ok::<_, ToolchainError>(output)
@@ -449,6 +454,16 @@ where
             .unwrap()
             .contains_eq_entry(&link_dependencies)
         {
+            let start = std::time::Instant::now();
+            log::info!(
+                "{} {}..",
+                match self.output_type {
+                    Type::StaticLibrary => "archiving",
+                    _ => "linking",
+                },
+                output_path.display()
+            );
+
             match self.output_type {
                 Type::Executable => {
                     let ld = self
@@ -481,6 +496,12 @@ where
                     libtool.archive(objects, &output_path).await?;
                 }
             }
+
+            log::info!(
+                "{} [{:.2}s]",
+                output_path.display(),
+                start.elapsed().as_secs_f32()
+            );
 
             dependency_map.lock().unwrap().replace(link_dependencies);
         }
