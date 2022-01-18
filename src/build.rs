@@ -411,8 +411,15 @@ where
                 );
 
                 let start = std::time::Instant::now();
+
                 let deps = cc.dependencies(input.clone()).await?;
-                let compiledb_entry = cc.compile(&input, &output).await?;
+                let (compiledb_entry, diagnostics) = cc.compile(&input, &output).await?;
+
+                if log::log_enabled!(log::Level::Warn) {
+                    if let Some(diagnostics) = diagnostics {
+                        diagnostics.lines().for_each(|line| log::warn!("{}", line));
+                    }
+                }
 
                 compiledb.lock().unwrap().0.replace(compiledb_entry);
 
@@ -503,7 +510,11 @@ where
                 start.elapsed().as_secs_f32()
             );
 
-            dependency_map.lock().unwrap().replace(link_dependencies);
+            dependency_map
+                .lock()
+                .unwrap()
+                .remove(Borrow::<std::path::Path>::borrow(&link_dependencies));
+            dependency_map.lock().unwrap().insert(link_dependencies);
         }
 
         Ok(output_path)

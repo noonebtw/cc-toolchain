@@ -69,7 +69,7 @@ pub mod traits {
             &self,
             input: I,
             output: O,
-        ) -> Result<CompileDBEntry, ToolchainError>
+        ) -> Result<(CompileDBEntry, Option<String>), ToolchainError>
         where
             I: AsRef<Path> + Send + Sync,
             O: AsRef<Path> + Send + Sync;
@@ -533,7 +533,11 @@ pub mod llvm {
             self
         }
 
-        async fn compile<I, O>(&self, input: I, output: O) -> Result<CompileDBEntry, ToolchainError>
+        async fn compile<I, O>(
+            &self,
+            input: I,
+            output: O,
+        ) -> Result<(CompileDBEntry, Option<String>), ToolchainError>
         where
             I: AsRef<Path> + Send + Sync,
             O: AsRef<Path> + Send + Sync,
@@ -561,7 +565,7 @@ pub mod llvm {
                 .map_err(|_| ToolchainError::CompilationError(input.as_ref().to_owned()))
                 .and_then(|output| async move {
                     match output.status.success() {
-                        true => Ok(()),
+                        true => Ok(String::from_utf8_lossy(&output.stderr).to_string()),
                         false => Err(ToolchainError::CompilationWithDiagnosticsError {
                             file: input_file,
                             diagnostics: String::from_utf8_lossy(&output.stderr).to_string(),
@@ -569,29 +573,36 @@ pub mod llvm {
                     }
                 })
                 .await
-                .map(|_| {
+                .map(|diagnostics: String| {
                     let input_string = input.as_ref().to_string_lossy().to_string();
 
-                    CompileDBEntry {
-                        directory: self
-                            .working_directory
-                            .as_ref()
-                            .map(|cwd| cwd.to_string_lossy().to_string()),
-                        file: input_string.clone(),
-                        arguments: None,
-                        command: Some(format!(
-                            "{} {} -o {} -c {}",
-                            self.cc.to_string_lossy().to_string(),
-                            self.flags
-                                .iter()
-                                .map(|s| s.to_string_lossy().to_string())
-                                .collect::<Vec<_>>()
-                                .join(" "),
-                            output.as_ref().to_string_lossy().to_string(),
-                            input_string,
-                        )),
-                        output: Some(output.as_ref().to_string_lossy().to_string()),
-                    }
+                    (
+                        CompileDBEntry {
+                            directory: self
+                                .working_directory
+                                .as_ref()
+                                .map(|cwd| cwd.to_string_lossy().to_string()),
+                            file: input_string.clone(),
+                            arguments: None,
+                            command: Some(format!(
+                                "{} {} -o {} -c {}",
+                                self.cc.to_string_lossy().to_string(),
+                                self.flags
+                                    .iter()
+                                    .map(|s| s.to_string_lossy().to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(" "),
+                                output.as_ref().to_string_lossy().to_string(),
+                                input_string,
+                            )),
+                            output: Some(output.as_ref().to_string_lossy().to_string()),
+                        },
+                        if diagnostics.is_empty() {
+                            None
+                        } else {
+                            Some(diagnostics)
+                        },
+                    )
                 })
         }
 
