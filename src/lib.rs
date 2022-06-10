@@ -267,6 +267,23 @@ pub mod llvm {
         default_ar_flags: Vec<OsString>,
     }
 
+    impl LLVM {
+        pub fn alloy() -> Self {
+            let compiler = which::which("alloy-cc").expect("compiler");
+            let linker = which::which("alloy-ld").expect("linker");
+            let archiver = which::which("alloy-ar").expect("archiver");
+
+            Self {
+                compiler,
+                linker,
+                archiver,
+                default_cc_flags: Default::default(),
+                default_ld_flags: Default::default(),
+                default_ar_flags: Default::default(),
+            }
+        }
+    }
+
     impl Default for LLVM {
         fn default() -> Self {
             let clang = which::which("clang").expect("clang");
@@ -460,7 +477,7 @@ pub mod llvm {
         fn linker(&self) -> Self::Linker {
             Lld {
                 working_directory: None,
-                lld: self.compiler.clone(),
+                lld: self.linker.clone(),
                 flags: self.default_ld_flags.clone(),
             }
         }
